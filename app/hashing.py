@@ -11,6 +11,8 @@ GENESIS_HASH = "GENESIS"
 CORRECTIONS_GENESIS_HASH = "CORRECTIONS_GENESIS"
 # 撤回链独立的创世前驱哈希：撤回只追加不可变记录，原交接记录与原链恒不变
 WITHDRAWALS_GENESIS_HASH = "WITHDRAWALS_GENESIS"
+# 待核封签事件独立的创世前驱哈希（待核事件按展品独立成链，记录不可变）
+SEAL_INCIDENTS_GENESIS_HASH = "SEAL_INCIDENTS_GENESIS"
 
 
 def canonical_json(obj) -> bytes:
@@ -156,6 +158,78 @@ def withdrawal_request_hash(
         "exhibit_id": exhibit_id,
         "batch_id": str(batch_id),
         "reason": (reason or "").strip(),
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def seal_incident_request_hash(
+    exhibit_id: str,
+    expected_seal: str,
+    observed_seal: str,
+    reason: str,
+) -> str:
+    """待核封签事件登记请求体指纹：用于幂等键下检测「同键不同载荷」。"""
+    payload = {
+        "exhibit_id": exhibit_id,
+        "expected_seal": (expected_seal or "").strip(),
+        "observed_seal": (observed_seal or "").strip(),
+        "reason": (reason or "").strip(),
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def seal_incident_close_request_hash(event_id, observed_seal: str, note: str) -> str:
+    """待核封签事件结案请求体指纹：用于幂等键下检测「同键不同载荷」。
+
+    与登记幂等键空间独立：结案键只绑定事件编号、复核实见封签与说明。
+    """
+    payload = {
+        "event_id": str(event_id),
+        "observed_seal": (observed_seal or "").strip(),
+        "note": (note or "").strip(),
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def seal_incident_hash(
+    *,
+    prev_hash: str,
+    event_id,
+    exhibit_id: str,
+    event_seq: int,
+    expected_seal: str,
+    observed_seal: str,
+    reason: str,
+    status: str,
+    review_observed_seal: str | None,
+    review_note: str | None,
+    registered_at: datetime,
+    closed_at: datetime | None,
+) -> str:
+    """单条待核封签事件的链式哈希：
+
+        seal_incident_hash = sha256(prev_hash ‖ 事件业务字段 ‖
+                                    结案复核字段 ‖ 登记/结案时间)
+
+    待核事件按展品独立成链（首环 prev_hash = SEAL_INCIDENTS_GENESIS）。
+    结案不另起记录，只在原事件行追加复核字段并把状态由 PENDING 改为 RESOLVED，
+    因此结案会重算/更新本环哈希——以结案时全字段计算的结果为准；登记后、
+    结案前任何字段被篡改，都会在复算时于该环定位。
+    """
+    payload = {
+        "prev_hash": prev_hash,
+        "kind": "seal_incident",
+        "event_id": str(event_id),
+        "exhibit_id": exhibit_id,
+        "event_seq": event_seq,
+        "expected_seal": expected_seal,
+        "observed_seal": observed_seal,
+        "reason": (reason or "").strip(),
+        "status": status,
+        "review_observed_seal": (review_observed_seal or "").strip() if review_observed_seal else "",
+        "review_note": (review_note or "").strip() if review_note else "",
+        "registered_at": norm_ts(registered_at),
+        "closed_at": norm_ts(closed_at) if closed_at is not None else "",
     }
     return sha256_hex(canonical_json(payload))
 

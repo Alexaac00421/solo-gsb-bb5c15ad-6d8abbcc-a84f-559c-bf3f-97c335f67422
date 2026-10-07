@@ -1,0 +1,5 @@
+{
+  "expected_seal": "SEAL-SH-1002",
+  "observed_seal": "SEAL-X-9001",
+  "reason": "开箱核查发现实物封签编号与系统当前有效封签不符，疑似运输途中被调换，登记待核"
+}

@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS exhibits (
     -- （旧卷迁移数据可能为 NULL；首站曾换签时以首环封签兜底）
     registered_custodian    TEXT,
     registered_initial_seal TEXT,
+    -- 实物封签异常待核事件链：按展品独立成链，登记/结案均与交接按展品串行；
+    -- 事件记录不可变，结案只在原事件行追加复核字段（PENDING -> RESOLVED）。
+    seal_incident_chain_length BIGINT   NOT NULL DEFAULT 0,
+    seal_incident_head_hash    TEXT     NOT NULL DEFAULT 'SEAL_INCIDENTS_GENESIS',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -128,6 +132,44 @@ CREATE TABLE IF NOT EXISTS vehicle_handovers (
     UNIQUE (idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_vehicle_handovers_vehicle ON vehicle_handovers (vehicle_id, created_at);
+
+-- 实物封签异常待核事件：馆方发现实物封签与系统封签不符时登记待核，
+-- 由复核人凭复核实见封签（须等于操作时撤回后当前有效封签）结案。
+-- 事件按展品独立哈希链、记录不可变；结案不另起行，只追加复核字段并把
+-- 状态由 PENDING 改为 RESOLVED。同一展品至多一件未结案事件——
+-- 部分唯一索引 uq_seal_inc_pending 兜底（应用层在展品行锁内先行判重）。
+-- 待核期间：预演报冲突且不签发令牌；单件交接与含该展品的整车交接整单
+-- 报冲突，不生成任何交接批次/报告或记录。补正与撤回照常办理。
+CREATE TABLE IF NOT EXISTS seal_incidents (
+    event_id                 UUID        PRIMARY KEY,
+    exhibit_id               TEXT        NOT NULL REFERENCES exhibits (exhibit_id),
+    event_seq                BIGINT      NOT NULL,    -- 展品级待核事件链序号（1 起，连续）
+    status                   TEXT        NOT NULL CHECK (status IN ('PENDING', 'RESOLVED')),
+    expected_seal            TEXT        NOT NULL,    -- 登记时预期系统封签（= 登记时撤回后当前有效封签）
+    observed_seal            TEXT        NOT NULL,    -- 登记时现场实见封签（与预期不同）
+    reason                   TEXT        NOT NULL,     -- 异常原因（非空）
+    review_observed_seal     TEXT,                    -- 结案复核实见封签（= 结案时当前有效封签）
+    review_note              TEXT,                    -- 复核说明
+    close_idempotency_key    TEXT,                    -- 结案幂等键（仅成功结案落库；冲突 409 不落库）
+    close_request_hash       TEXT,                    -- 结案请求指纹
+    prev_hash                TEXT        NOT NULL,    -- 前一环事件 record_hash（首环为 SEAL_INCIDENTS_GENESIS）
+    record_hash              TEXT        NOT NULL,    -- 本环哈希（含全字段与登记/结案时间）
+    register_idempotency_key TEXT        NOT NULL,    -- 登记幂等键（全局唯一）
+    register_request_hash    TEXT        NOT NULL,    -- 登记请求指纹（同键不同载荷 -> 409）
+    registered_at            TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 服务端登记时间（待核起点）
+    closed_at                TIMESTAMPTZ,             -- 服务端结案时间（仍待核时为 NULL）
+    UNIQUE (exhibit_id, event_seq),
+    UNIQUE (register_idempotency_key),
+    UNIQUE (record_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_seal_inc_exhibit_seq ON seal_incidents (exhibit_id, event_seq);
+-- 同一展品至多一件 PENDING（重复待核由应用层先判，并发由本索引兜底 -> 409）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_seal_inc_pending
+    ON seal_incidents (exhibit_id) WHERE status = 'PENDING';
+-- 结案幂等键全局唯一（仅对已落库的成功结案行生效，NULL 不参与唯一约束）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_seal_inc_close_key
+    ON seal_incidents (close_idempotency_key)
+    WHERE close_idempotency_key IS NOT NULL;
 
 -- 种子数据：两件已登记展品，便于开箱即测
 INSERT INTO exhibits (exhibit_id, name, home_location, custodian, current_seal,

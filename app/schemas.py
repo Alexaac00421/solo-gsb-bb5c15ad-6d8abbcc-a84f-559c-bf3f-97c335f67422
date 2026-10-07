@@ -82,6 +82,39 @@ class WithdrawalRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500, description="撤回原因（非空；空缺 -> 422 拒绝）")
 
 
+# ---------------------------------------------------------------- 实物封签异常待核事件
+
+
+class SealIncidentRegisterRequest(BaseModel):
+    """实物封签异常待核事件登记请求。
+
+    - expected_seal：馆方预期的系统封签，须等于撤回后当前有效封签（不符 -> 409）；
+    - observed_seal：现场实见封签，须非空合法且与预期值不同（相同 -> 422）；
+    - reason：异常原因（非空 -> 422）。
+    同一展品同时只允许一件未结案（PENDING）事件（重复登记 -> 409）。
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    expected_seal: str = Field(min_length=1, max_length=100, description="预期系统封签（须等于撤回后当前有效封签）")
+    observed_seal: str = Field(min_length=1, max_length=100, description="实见封签（须与预期值不同）")
+    reason: str = Field(min_length=1, max_length=500, description="异常原因（非空）")
+
+
+class SealIncidentCloseRequest(BaseModel):
+    """待核封签事件结案请求（复核人提交）。
+
+    - observed_seal：复核实见封签，须等于操作时撤回后当前有效封签，
+      否则事件保持 PENDING 并返回 409 冲突；
+    - note：复核说明（非空 -> 422）。
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    observed_seal: str = Field(min_length=1, max_length=100, description="复核实见封签（须等于操作时当前有效封签）")
+    note: str = Field(min_length=1, max_length=500, description="复核说明（非空）")
+
+
 class ReasonOut(BaseModel):
     rule: str
     message: str
@@ -335,6 +368,11 @@ class AsOfStateOut(BaseModel):
     # 三条事件链在该时点的长度（三链在同一数据库快照截取）
     correction_chain_length: int = Field(description="知悉时刻已受理补正环数（按目标在可见原链内计）")
     withdrawal_chain_length: int = Field(description="知悉时刻已受理撤回环数")
+    # 实物封签异常待核事件：该时点（registered_at <= at 且尚未结案）的唯一未结案事件；
+    # 该时点无待核事件为 null。边界同样只认服务端登记/结案时间。
+    pending_seal_incident: Optional["AsOfSealIncidentOut"] = Field(
+        default=None, description="知悉时刻未结案的待核封签事件（无则为 null）"
+    )
 
 
 class AuditVerifyOut(BaseModel):
@@ -351,6 +389,8 @@ class AuditVerifyOut(BaseModel):
     withdrawal_chain_length: Optional[int] = 0
     withdrawals_chain: Optional[ChainAuditBlock] = None
     effective_chain_length: Optional[int] = None
+    # 待核封签事件引入：复算待核事件链（新增字段，向后兼容）
+    seal_incidents_chain: Optional[ChainAuditBlock] = None
 
 
 class BatchSummary(BaseModel):
@@ -362,6 +402,46 @@ class BatchSummary(BaseModel):
     # 撤回引入：批次是否已被撤回及其撤回引用（新增字段，向后兼容）
     withdrawn: bool = False
     withdrawal: Optional[WithdrawalRefOut] = None
+
+
+# ---------------------------------------------------------------- 实物封签异常待核事件
+
+
+class SealIncidentOut(BaseModel):
+    """实物封签异常待核事件（登记 201；结案/重放 200）。
+
+    登记返回事件编号、状态（PENDING/RESOLVED）与登记时间；
+    结案成功后事件转为 RESOLVED 并回带复核实见封签、说明与结案时间。
+    """
+
+    event_id: str
+    exhibit_id: str
+    event_seq: int = Field(description="展品级待核事件链序号（1 起，连续）")
+    status: Literal["PENDING", "RESOLVED"]
+    expected_seal: str = Field(description="登记时预期系统封签（= 登记时撤回后当前有效封签）")
+    observed_seal: str = Field(description="登记时现场实见封签（与预期不同）")
+    reason: str = Field(description="异常原因")
+    # 结案复核字段（PENDING 时为 null）
+    review_observed_seal: Optional[str] = Field(default=None, description="结案复核实见封签（= 结案时当前有效封签）")
+    review_note: Optional[str] = Field(default=None, description="复核说明")
+    prev_hash: str
+    record_hash: str
+    idempotent_replay: bool
+    registered_at: datetime = Field(description="服务端登记时间（待核状态起点）")
+    closed_at: Optional[datetime] = Field(default=None, description="服务端结案时间（仍待核时为 null）")
+
+
+class AsOfSealIncidentOut(BaseModel):
+    """知悉时刻快照中的待核封签事件（该时点未结案才出现；该时点无待核事件为 null）。"""
+
+    event_id: str
+    event_seq: int
+    status: Literal["PENDING"]
+    expected_seal: str
+    observed_seal: str
+    reason: str
+    registered_at: datetime = Field(description="服务端登记时间（以该时间为界进入待核）")
+    closed_at: Optional[datetime] = Field(default=None, description="该时点为 null（已结案即不出现在快照中）")
 
 
 class HandoverTokenOut(BaseModel):

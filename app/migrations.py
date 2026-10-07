@@ -9,6 +9,8 @@
 - v1.3：批次撤回链（batch_withdrawals 表、exhibits.withdrawal_* 列，
         以及撤回后回退状态所需的 registered_custodian/registered_initial_seal 列）
 - v1.4：车次整车交接单（vehicle_handovers 表）
+- v1.5：实物封签异常待核事件（seal_incidents 表、
+        exhibits.seal_incident_* 列；同一展品至多一件 PENDING 部分唯一索引）
 """
 from __future__ import annotations
 
@@ -18,6 +20,8 @@ from .db import get_conn
 CORRECTIONS_GENESIS_HASH = "CORRECTIONS_GENESIS"
 # 撤回链创世前驱哈希（撤回链同样独立成链）
 WITHDRAWALS_GENESIS_HASH = "WITHDRAWALS_GENESIS"
+# 待核封签事件链创世前驱哈希（待核事件同样按展品独立成链）
+SEAL_INCIDENTS_GENESIS_HASH = "SEAL_INCIDENTS_GENESIS"
 
 _STATEMENTS = (
     """
@@ -125,6 +129,44 @@ _STATEMENTS = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_vehicle_handovers_vehicle ON vehicle_handovers (vehicle_id, created_at)",
+    # ---------------------------------------------------------------- 实物封签异常待核事件
+    # 按展品独立成链、记录不可变；结案不另起行，只在原事件行追加复核字段并
+    # 把状态 PENDING -> RESOLVED。同一展品至多一件 PENDING 事件（部分唯一索引）。
+    """
+    ALTER TABLE exhibits
+        ADD COLUMN IF NOT EXISTS seal_incident_chain_length BIGINT NOT NULL DEFAULT 0
+    """,
+    """
+    ALTER TABLE exhibits
+        ADD COLUMN IF NOT EXISTS seal_incident_head_hash TEXT NOT NULL DEFAULT 'SEAL_INCIDENTS_GENESIS'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS seal_incidents (
+        event_id              UUID        PRIMARY KEY,
+        exhibit_id            TEXT        NOT NULL REFERENCES exhibits (exhibit_id),
+        event_seq             BIGINT      NOT NULL,
+        status                TEXT        NOT NULL CHECK (status IN ('PENDING', 'RESOLVED')),
+        expected_seal         TEXT        NOT NULL,
+        observed_seal         TEXT        NOT NULL,
+        reason                TEXT        NOT NULL,
+        review_observed_seal  TEXT,
+        review_note           TEXT,
+        close_idempotency_key TEXT,
+        close_request_hash    TEXT,
+        prev_hash             TEXT        NOT NULL,
+        record_hash           TEXT        NOT NULL,
+        register_idempotency_key TEXT     NOT NULL,
+        register_request_hash    TEXT     NOT NULL,
+        registered_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+        closed_at             TIMESTAMPTZ,
+        UNIQUE (exhibit_id, event_seq),
+        UNIQUE (register_idempotency_key),
+        UNIQUE (record_hash)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_seal_inc_exhibit_seq ON seal_incidents (exhibit_id, event_seq)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_seal_inc_pending ON seal_incidents (exhibit_id) WHERE status = 'PENDING'",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_seal_inc_close_key ON seal_incidents (close_idempotency_key) WHERE close_idempotency_key IS NOT NULL",
 )
 
 

@@ -15,11 +15,15 @@ from .db import get_conn, wait_for_db
 from .hashing import (
     CORRECTIONS_GENESIS_HASH,
     GENESIS_HASH,
+    SEAL_INCIDENTS_GENESIS_HASH,
     WITHDRAWALS_GENESIS_HASH,
     correction_hash,
     correction_request_hash,
     record_hash,
     request_hash,
+    seal_incident_close_request_hash,
+    seal_incident_hash,
+    seal_incident_request_hash,
     vehicle_request_hash,
     withdrawal_hash,
     withdrawal_request_hash,
@@ -38,6 +42,9 @@ from .schemas import (
     ExhibitOut,
     HandoverRecordOut,
     RehearsalOut,
+    SealIncidentCloseRequest,
+    SealIncidentOut,
+    SealIncidentRegisterRequest,
     VehicleHandoverReport,
     VehicleHandoverRequest,
     WithdrawalOut,
@@ -50,7 +57,12 @@ from .tokens import (
     parse_token,
     state_matches,
 )
-from .validation import ExhibitState, is_valid_voucher_digest, validate_batch
+from .validation import (
+    ExhibitState,
+    is_valid_seal_no,
+    is_valid_voucher_digest,
+    validate_batch,
+)
 
 
 @asynccontextmanager
@@ -78,6 +90,23 @@ def _withdrawn_batch_ids(conn, exhibit_id: str) -> set[uuid.UUID]:
         (exhibit_id,),
     ).fetchall()
     return {r["batch_id"] for r in rows}
+
+
+def _pending_seal_incident(conn, exhibit_id: str) -> dict | None:
+    """该展品当前未结案（PENDING）的实物封签待核事件；无则 None。
+
+    同一展品至多一件 PENDING（部分唯一索引 uq_seal_inc_pending 兜底）。
+    待核期间冻结该展品的交接类操作（预演不签发令牌、单件/整车交接整单冲突），
+    补正与撤回不冻结、照常办理。
+    """
+    return conn.execute(
+        """
+        SELECT * FROM seal_incidents
+         WHERE exhibit_id = %s AND status = 'PENDING'
+         LIMIT 1
+        """,
+        (exhibit_id,),
+    ).fetchone()
 
 
 def _effective_chain_rows(conn, exhibit: dict, withdrawn: set[uuid.UUID]) -> list[dict]:
@@ -644,6 +673,92 @@ def _verify_corrections_chain(conn, exhibit: dict, handover_by_seq: dict[int, di
     }
 
 
+def _verify_seal_incidents_chain(conn, exhibit: dict) -> dict:
+    """复算实物封签待核事件链并校验链尾/未结案唯一性。
+
+    每环按其登记字段与（结案后追加的）复核字段、登记/结案时间重算 record_hash：
+    事件行被篡改（含复核结论、状态、时间）或乱序，即在首个失效环定位。
+    链尾校验展品 seal_incident_chain_length/head_hash；PENDING 事件至多一件
+    且若存在必为链尾（待核期间不允许登记新事件）。
+    """
+    rows = conn.execute(
+        "SELECT * FROM seal_incidents WHERE exhibit_id = %s ORDER BY event_seq",
+        (exhibit["exhibit_id"],),
+    ).fetchall()
+
+    prev = SEAL_INCIDENTS_GENESIS_HASH
+    pending_count = 0
+    for row in rows:
+        expected = seal_incident_hash(
+            prev_hash=prev,
+            event_id=row["event_id"],
+            exhibit_id=row["exhibit_id"],
+            event_seq=row["event_seq"],
+            expected_seal=row["expected_seal"],
+            observed_seal=row["observed_seal"],
+            reason=row["reason"],
+            status=row["status"],
+            review_observed_seal=row["review_observed_seal"],
+            review_note=row["review_note"],
+            registered_at=row["registered_at"],
+            closed_at=row["closed_at"],
+        )
+        if row["prev_hash"] != prev or row["record_hash"] != expected:
+            return {
+                "chain_length": len(rows),
+                "head_hash": prev,
+                "valid": False,
+                "first_invalid_seq": row["event_seq"],
+                "detail": f"待核事件链第 {row['event_seq']} 环哈希校验失败："
+                          "事件记录（含复核结论/状态/时间）被篡改、删除或顺序被调换",
+            }
+        # 状态与复核字段一致性：RESOLVED 必有复核三要素，PENDING 必无
+        if row["status"] == "RESOLVED":
+            if not row["review_observed_seal"] or not row["review_note"] or row["closed_at"] is None:
+                return {
+                    "chain_length": len(rows),
+                    "head_hash": prev,
+                    "valid": False,
+                    "first_invalid_seq": row["event_seq"],
+                    "detail": f"待核事件链第 {row['event_seq']} 环状态为 RESOLVED 但复核结论或结案时间缺失",
+                }
+        else:
+            pending_count += 1
+            if row["review_observed_seal"] or row["review_note"] or row["closed_at"] is not None:
+                return {
+                    "chain_length": len(rows),
+                    "head_hash": prev,
+                    "valid": False,
+                    "first_invalid_seq": row["event_seq"],
+                    "detail": f"待核事件链第 {row['event_seq']} 环状态为 PENDING 却带有复核结论或结案时间",
+                }
+        prev = row["record_hash"]
+
+    if prev != exhibit["seal_incident_head_hash"] or len(rows) != exhibit["seal_incident_chain_length"]:
+        return {
+            "chain_length": len(rows),
+            "head_hash": prev,
+            "valid": False,
+            "first_invalid_seq": None,
+            "detail": "待核事件链尾哈希或链长与展品当前待核事件状态不一致",
+        }
+    if pending_count > 1:
+        return {
+            "chain_length": len(rows),
+            "head_hash": prev,
+            "valid": False,
+            "first_invalid_seq": None,
+            "detail": f"存在 {pending_count} 件未结案待核事件，同一展品至多允许一件",
+        }
+    return {
+        "chain_length": len(rows),
+        "head_hash": prev,
+        "valid": True,
+        "first_invalid_seq": None,
+        "detail": "待核封签事件哈希链完整，登记/结案记录一致，未结案事件至多一件",
+    }
+
+
 # ---------------------------------------------------------------- 健康检查
 
 
@@ -712,6 +827,16 @@ def rehearse_handover_batch(payload: BatchRequest):
         ).fetchone()
         if not exhibit:
             raise HTTPException(status_code=404, detail=f"展品「{payload.exhibit_id}」不存在")
+        # 待核冻结：该展品存在未结案封签事件时，预演直接报冲突且不签发令牌
+        # （同键重试不经过本端点：预演本身不幂等落单，无原结果可返回）
+        pending = _pending_seal_incident(conn, payload.exhibit_id)
+        if pending:
+            raise HTTPException(
+                status_code=409,
+                detail=f"展品「{payload.exhibit_id}」存在未结案的实物封签待核事件"
+                       f"（事件编号 {pending['event_id']}），待核期间暂停交接："
+                       "预演报冲突且不签发令牌，请待事件结案后重新预演",
+            )
         # 撤回后预演：以按撤回链计算的有效状态作为规则核验参照（只读，不写任何数据）
         withdrawn = _withdrawn_batch_ids(conn, payload.exhibit_id)
         effective = _effective_state(conn, exhibit, withdrawn)
@@ -805,7 +930,18 @@ def submit_handover_batch(
                     )
                 raise HTTPException(status_code=404, detail=f"展品「{payload.exhibit_id}」不存在")
 
-            # 4) 令牌归属与链状态比对（行锁内完成，与链推进互斥）
+            # 4a) 待核冻结：存在未结案封签事件时单件交接整单报冲突，
+            #     不写批次报告/交接记录（既有幂等落单的同键重试已在第 2 步优先返回原结果）
+            pending = _pending_seal_incident(conn, payload.exhibit_id)
+            if pending:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"展品「{payload.exhibit_id}」存在未结案的实物封签待核事件"
+                           f"（事件编号 {pending['event_id']}），待核期间暂停单件交接，"
+                           "整单报冲突且不生成新交接报告或记录；请待事件结案后重新预演提交",
+                )
+
+            # 4b) 令牌归属与链状态比对（行锁内完成，与链推进互斥）
             if parsed_token is not None:
                 if parsed_token.exhibit_id != payload.exhibit_id:
                     raise HTTPException(
@@ -947,6 +1083,26 @@ def submit_vehicle_handover(
                         detail="同一 Idempotency-Key 提交了不同的整车交接请求载荷",
                     )
                 return _vehicle_replay(existing)
+
+            # 2c) 待核冻结：任一涉及展品存在未结案封签事件时整车交接整单报冲突，
+            #     不写整单报告、不写任何批次/记录（幂等落单的同键重试已在上面优先重放）
+            pending_rows = conn.execute(
+                """
+                SELECT exhibit_id, event_id FROM seal_incidents
+                 WHERE exhibit_id = ANY(%s) AND status = 'PENDING'
+                 ORDER BY exhibit_id
+                """,
+                (exhibit_ids,),
+            ).fetchall()
+            if pending_rows:
+                detail_pairs = "、".join(
+                    f"展品「{r['exhibit_id']}」(事件 {r['event_id']})" for r in pending_rows
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"整车交接包含待核期间的展品：{detail_pairs}；"
+                    "待核期间整车交接整单报冲突，不生成新交接报告或记录",
+                )
 
             # 3) 逐件核验：以撤回后的有效状态为参照（与单件接口同一套规则引擎）
             per_item = []
@@ -1779,6 +1935,24 @@ def get_exhibit_state_at(exhibit_id: str, at: str = Query(..., description="知�
                 (exhibit_id, as_of),
             ).fetchall()
 
+            # 4) 实物封签待核事件：以服务端登记时间/结案时间为界。
+            #    registered_at <= at 且（未结案或结案时间晚于 at）-> 该时点处于待核；
+            #    边界含等号：恰在结案时刻结案即不再待核，恰在登记时刻登记即视为待核。
+            #    同一展品至多一件 PENDING，快照内至多一条。
+            pending_incident = conn.execute(
+                """
+                SELECT event_id, event_seq, status, expected_seal, observed_seal, reason,
+                       registered_at, closed_at
+                  FROM seal_incidents
+                 WHERE exhibit_id = %s
+                   AND registered_at <= %s
+                   AND (closed_at IS NULL OR closed_at > %s)
+                 ORDER BY event_seq DESC
+                 LIMIT 1
+                """,
+                (exhibit_id, as_of, as_of),
+            ).fetchone()
+
     # 原链：chain_seq 连续前缀，链头取最后一环（其后被撤回也不影响该时点长度/链头）
     chain_length = len(records)
     chain_head_hash = records[-1]["record_hash"] if records else GENESIS_HASH
@@ -1844,6 +2018,20 @@ def get_exhibit_state_at(exhibit_id: str, at: str = Query(..., description="知�
         "last_handover_time": last_handover_time,
         "correction_chain_length": applied_corrections,
         "withdrawal_chain_length": len(withdrawals),
+        "pending_seal_incident": (
+            {
+                "event_id": str(pending_incident["event_id"]),
+                "event_seq": pending_incident["event_seq"],
+                "status": "PENDING",
+                "expected_seal": pending_incident["expected_seal"],
+                "observed_seal": pending_incident["observed_seal"],
+                "reason": pending_incident["reason"],
+                "registered_at": pending_incident["registered_at"],
+                "closed_at": None,
+            }
+            if pending_incident is not None
+            else None
+        ),
     }
 
 
@@ -1878,18 +2066,26 @@ def verify_audit_chain(exhibit_id: str):
         withdrawals_result = _verify_withdrawals_chain(
             conn, exhibit, records, handover_result["honest"]
         )
+        seal_incidents_block = _verify_seal_incidents_chain(conn, exhibit)
 
     handover_block = handover_result["block"]
     withdrawals_block = withdrawals_result["block"]
-    all_valid = handover_block["valid"] and corrections_block["valid"] and withdrawals_block["valid"]
+    all_valid = (
+        handover_block["valid"]
+        and corrections_block["valid"]
+        and withdrawals_block["valid"]
+        and seal_incidents_block["valid"]
+    )
     if all_valid:
-        detail = "交接链、补正链与撤回链均完整；补正/撤回锚点与原交接记录一致，撤回后有效状态正确"
+        detail = "交接链、补正链、撤回链与待核事件链均完整；补正/撤回锚点与原交接记录一致，撤回后有效状态正确"
     elif not handover_block["valid"]:
         detail = handover_block["detail"]
     elif not corrections_block["valid"]:
         detail = corrections_block["detail"]
-    else:
+    elif not withdrawals_block["valid"]:
         detail = withdrawals_block["detail"]
+    else:
+        detail = seal_incidents_block["detail"]
 
     effective_info = withdrawals_result.get("effective") or {}
     return {
@@ -1904,6 +2100,7 @@ def verify_audit_chain(exhibit_id: str):
         "handover_chain": handover_block,
         "corrections_chain": corrections_block,
         "withdrawals_chain": withdrawals_block,
+        "seal_incidents_chain": seal_incidents_block,
     }
 
 
@@ -1943,3 +2140,423 @@ def list_batches(
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------- 实物封签异常待核事件
+
+
+def _serialize_seal_incident(row: dict, *, replay: bool) -> dict:
+    """序列化待核封签事件（登记/结案/查询/重放共用）。"""
+    return {
+        "event_id": str(row["event_id"]),
+        "exhibit_id": row["exhibit_id"],
+        "event_seq": row["event_seq"],
+        "status": row["status"],
+        "expected_seal": row["expected_seal"],
+        "observed_seal": row["observed_seal"],
+        "reason": row["reason"],
+        "review_observed_seal": row["review_observed_seal"],
+        "review_note": row["review_note"],
+        "prev_hash": row["prev_hash"],
+        "record_hash": row["record_hash"],
+        "idempotent_replay": replay,
+        "registered_at": row["registered_at"],
+        "closed_at": row["closed_at"],
+    }
+
+
+def _seal_incident_register_replay(row: dict) -> dict:
+    """登记幂等重放：返回首次登记响应快照（事件始终为登记时的 PENDING 形态）。
+
+    与补正/撤回一致，登记重放原样回首次结果，不反映事件此后的结案状态
+    （当前状态请经事件查询/列表获取）。
+    """
+    result = {
+        "event_id": str(row["event_id"]),
+        "exhibit_id": row["exhibit_id"],
+        "event_seq": row["event_seq"],
+        "status": "PENDING",
+        "expected_seal": row["expected_seal"],
+        "observed_seal": row["observed_seal"],
+        "reason": row["reason"],
+        "review_observed_seal": None,
+        "review_note": None,
+        "prev_hash": row["prev_hash"],
+        "record_hash": row["record_hash"],
+        "idempotent_replay": True,
+        "registered_at": row["registered_at"],
+        "closed_at": None,
+    }
+    return result
+
+
+@app.post(
+    "/api/v1/exhibits/{exhibit_id}/seal-incidents",
+    response_model=SealIncidentOut,
+    status_code=201,
+    tags=["seal-incidents"],
+)
+def register_seal_incident(
+    exhibit_id: str,
+    payload: SealIncidentRegisterRequest,
+    response: Response,
+    idempotency_key: str = Header(min_length=1, max_length=128),
+):
+    """馆方发现实物封签异常：登记一件待核封签事件。
+
+    请求体：预期系统封签 expected_seal、现场实见封签 observed_seal、异常原因
+    reason，以及 Idempotency-Key 请求头。
+
+    - expected_seal 须等于**撤回后当前有效封签**（不符 -> 409）；
+    - observed_seal 须为合法封签且与 expected_seal 不同
+      （格式非法/含空白 -> 422；与预期相同即未构成异常 -> 422）；
+    - reason 非空（空/纯空白由模型校验 -> 422）；
+    - 未知展品 -> 404；同一展品已有未结案事件 -> 409（重复待核）。
+    - 幂等（先于业务校验按登记幂等键重放）：同键同载荷 -> 首次登记结果，
+      200 + idempotent_replay=true（即使事件此后已结案）；同键异载荷 -> 409。
+
+    待核登记、结案与交接按展品串行：本处理在展品行 FOR UPDATE 锁内完成
+    「查重 -> CAS 比对 -> 落事件/推进事件链」，与单件/整车交接、补正、撤回互斥。
+    """
+    expected_seal = payload.expected_seal.strip()
+    observed_seal = payload.observed_seal.strip()
+    if not is_valid_seal_no(expected_seal):
+        raise HTTPException(status_code=422, detail="expected_seal 封签号非法：须为非空、不含空白字符、长度不超过 100")
+    if not is_valid_seal_no(observed_seal):
+        raise HTTPException(status_code=422, detail="observed_seal 封签号非法：须为非空、不含空白字符、长度不超过 100")
+    if observed_seal == expected_seal:
+        raise HTTPException(
+            status_code=422,
+            detail=f"实见封签「{observed_seal}」与预期系统封签相同，未构成实物封签异常",
+        )
+
+    req_hash = seal_incident_request_hash(
+        exhibit_id, expected_seal, observed_seal, payload.reason
+    )
+
+    try:
+        with get_conn() as conn:
+            # 1) 幂等预检：同键同载荷即使业务前提已变化（已结案/封签已变），
+            #    也先返回首次登记结果；同键异载荷 409
+            existing = conn.execute(
+                "SELECT * FROM seal_incidents WHERE register_idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                if existing["register_request_hash"] != req_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="同一 Idempotency-Key 提交了不同的待核事件登记请求载荷",
+                    )
+                response.status_code = 200
+                return _seal_incident_register_replay(existing)
+
+            # 2) 锁定展品行：待核登记/结案与交接、补正、撤回按展品串行
+            exhibit = conn.execute(
+                "SELECT * FROM exhibits WHERE exhibit_id = %s FOR UPDATE",
+                (exhibit_id,),
+            ).fetchone()
+            if not exhibit:
+                raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+
+            # 2b) 行锁内再查一次幂等：串行化同键并发登记
+            existing = conn.execute(
+                "SELECT * FROM seal_incidents WHERE register_idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                if existing["register_request_hash"] != req_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="同一 Idempotency-Key 提交了不同的待核事件登记请求载荷",
+                    )
+                response.status_code = 200
+                return _seal_incident_register_replay(existing)
+
+            # 3) 同一展品只能有一件未结案事件
+            pending = _pending_seal_incident(conn, exhibit_id)
+            if pending:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"展品「{exhibit_id}」已存在未结案待核事件"
+                           f"（事件编号 {pending['event_id']}，{pending['status']}）；"
+                           "同一展品只能有一件未结案事件，请先结案后再登记",
+                )
+
+            # 4) CAS：预期值须等于撤回后当前有效封签（补正不影响封签；撤回按有效链重放）
+            withdrawn = _withdrawn_batch_ids(conn, exhibit_id)
+            effective = _effective_state(conn, exhibit, withdrawn)
+            current_seal = effective["current_seal"]
+            if expected_seal != current_seal:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"预期系统封签与撤回后当前有效封签不符：预期「{expected_seal}」，"
+                           f"当前有效封签「{current_seal}」",
+                )
+
+            # 5) 追加待核事件链一环（展品独立链，首环 prev_hash=SEAL_INCIDENTS_GENESIS）
+            event_id = uuid.uuid4()
+            now = datetime.now(timezone.utc)
+            event_seq = exhibit["seal_incident_chain_length"] + 1
+            prev_hash = exhibit["seal_incident_head_hash"]
+            h = seal_incident_hash(
+                prev_hash=prev_hash,
+                event_id=event_id,
+                exhibit_id=exhibit_id,
+                event_seq=event_seq,
+                expected_seal=expected_seal,
+                observed_seal=observed_seal,
+                reason=payload.reason,
+                status="PENDING",
+                review_observed_seal=None,
+                review_note=None,
+                registered_at=now,
+                closed_at=None,
+            )
+            conn.execute(
+                """
+                INSERT INTO seal_incidents
+                    (event_id, exhibit_id, event_seq, status, expected_seal, observed_seal,
+                     reason, review_observed_seal, review_note, close_idempotency_key,
+                     close_request_hash, prev_hash, record_hash,
+                     register_idempotency_key, register_request_hash, registered_at, closed_at)
+                VALUES (%s, %s, %s, 'PENDING', %s, %s, %s, NULL, NULL, NULL, NULL, %s, %s, %s, %s, %s, NULL)
+                """,
+                (event_id, exhibit_id, event_seq, expected_seal, observed_seal,
+                 payload.reason, prev_hash, h, idempotency_key, req_hash, now),
+            )
+            conn.execute(
+                """
+                UPDATE exhibits
+                   SET seal_incident_chain_length = %s, seal_incident_head_hash = %s
+                 WHERE exhibit_id = %s
+                """,
+                (event_seq, h, exhibit_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM seal_incidents WHERE event_id = %s", (event_id,)
+            ).fetchone()
+            return _serialize_seal_incident(row, replay=False)
+    except UniqueViolation:
+        # 并发：同键插入或同展品第二件 PENDING。回滚后按已存行判定
+        # （等价后到重试 -> 200 重放；异载荷/重复待核 -> 409）。
+        with get_conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM seal_incidents WHERE register_idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+        if existing and existing["register_request_hash"] == req_hash:
+            response.status_code = 200
+            return _seal_incident_register_replay(existing)
+        if existing:
+            raise HTTPException(status_code=409, detail="同一 Idempotency-Key 提交了不同的待核事件登记请求载荷")
+        raise HTTPException(
+            status_code=409,
+            detail="登记冲突：同一展品已被并发登记了另一件未结案待核事件，请先结案后再登记",
+        )
+
+
+@app.post(
+    "/api/v1/exhibits/{exhibit_id}/seal-incidents/{event_id}/close",
+    response_model=SealIncidentOut,
+    tags=["seal-incidents"],
+)
+def close_seal_incident(
+    exhibit_id: str,
+    event_id: uuid.UUID,
+    payload: SealIncidentCloseRequest,
+    idempotency_key: str = Header(min_length=1, max_length=128),
+):
+    """复核人结案一件待核封签事件。
+
+    请求体：复核实见封签 observed_seal、复核说明 note，以及 Idempotency-Key 头。
+
+    - observed_seal 须为合法封签（非法/含空白 -> 422）；note 非空（空 -> 422）；
+    - 事件编号格式非法 -> 422；未知展品 -> 404；
+    - 事件不存在或不属于该展品（事件不匹配）-> 404；
+    - 事件已结案（再提交结案）-> 409；
+    - 复核实见封签与**操作时撤回后当前有效封签**不一致 -> 409，
+      事件**保持 PENDING**、不写复核结论（冲突结果不落库；换新键可在封签更正后重试）。
+    - 幂等（先于业务校验）：同键同载荷 -> 原结案结果，idempotent_replay=true；
+      同键异载荷 -> 409。结案始终复核**操作当时**的有效封签。
+    """
+    observed_seal = payload.observed_seal.strip()
+    if not is_valid_seal_no(observed_seal):
+        raise HTTPException(status_code=422, detail="observed_seal 封签号非法：须为非空、不含空白字符、长度不超过 100")
+
+    req_hash = seal_incident_close_request_hash(event_id, observed_seal, payload.note)
+
+    try:
+        with get_conn() as conn:
+            # 1) 幂等预检（结案键空间独立）：同键同载荷先返回原结案结果
+            existing = conn.execute(
+                "SELECT * FROM seal_incidents WHERE close_idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                if existing["close_request_hash"] != req_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="同一 Idempotency-Key 提交了不同的待核事件结案请求载荷",
+                    )
+                return _serialize_seal_incident(existing, replay=True)
+
+            # 2) 锁定展品行：结案与登记、交接、补正、撤回按展品串行
+            exhibit = conn.execute(
+                "SELECT * FROM exhibits WHERE exhibit_id = %s FOR UPDATE",
+                (exhibit_id,),
+            ).fetchone()
+            if not exhibit:
+                raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+
+            # 2b) 行锁内再查一次结案幂等：串行化同键并发结案
+            existing = conn.execute(
+                "SELECT * FROM seal_incidents WHERE close_idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                if existing["close_request_hash"] != req_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="同一 Idempotency-Key 提交了不同的待核事件结案请求载荷",
+                    )
+                return _serialize_seal_incident(existing, replay=True)
+
+            # 3) 事件存在性与归属（事件不匹配明确报错）
+            event = conn.execute(
+                "SELECT * FROM seal_incidents WHERE event_id = %s",
+                (event_id,),
+            ).fetchone()
+            if not event or event["exhibit_id"] != exhibit_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"展品「{exhibit_id}」不存在待核事件「{event_id}」（事件不存在或不属于该展品）",
+                )
+            if event["status"] != "PENDING":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"待核事件「{event_id}」已结案（{event['status']}），不可重复结案",
+                )
+
+            # 4) 复核值须等于操作时撤回后当前有效封签；不符保持 PENDING、报冲突
+            withdrawn = _withdrawn_batch_ids(conn, exhibit_id)
+            effective = _effective_state(conn, exhibit, withdrawn)
+            current_seal = effective["current_seal"]
+            if observed_seal != current_seal:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"复核实见封签与操作时当前有效封签不符：复核值「{observed_seal}」，"
+                           f"当前有效封签「{current_seal}」；事件保持待核，"
+                           "请核对后以新的幂等键重新提交结案",
+                )
+
+            # 5) 结案：在原事件行追加复核字段，状态 PENDING -> RESOLVED，重算本环哈希。
+            #    事件记录不可变（不新增/删除业务事实行），结案是该环的状态终态落定；
+            #    事件链头/链长不变（仍是同一环）。
+            now = datetime.now(timezone.utc)
+            h = seal_incident_hash(
+                prev_hash=event["prev_hash"],
+                event_id=event_id,
+                exhibit_id=exhibit_id,
+                event_seq=event["event_seq"],
+                expected_seal=event["expected_seal"],
+                observed_seal=event["observed_seal"],
+                reason=event["reason"],
+                status="RESOLVED",
+                review_observed_seal=observed_seal,
+                review_note=payload.note,
+                registered_at=event["registered_at"],
+                closed_at=now,
+            )
+            conn.execute(
+                """
+                UPDATE seal_incidents
+                   SET status = 'RESOLVED', review_observed_seal = %s, review_note = %s,
+                       close_idempotency_key = %s, close_request_hash = %s,
+                       record_hash = %s, closed_at = %s
+                 WHERE event_id = %s AND status = 'PENDING'
+                """,
+                (observed_seal, payload.note, idempotency_key, req_hash, h, now, event_id),
+            )
+            # 待核事件恒为事件链尾（待核期间不能登记新事件）：结案重算了本环哈希，
+            # 链长不变、链头同步到结案后哈希。
+            conn.execute(
+                """
+                UPDATE exhibits
+                   SET seal_incident_head_hash = %s
+                 WHERE exhibit_id = %s
+                """,
+                (h, exhibit_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM seal_incidents WHERE event_id = %s", (event_id,)
+            ).fetchone()
+            return _serialize_seal_incident(row, replay=False)
+    except UniqueViolation:
+        # 并发同键结案：回滚后按已存结案行重放；异载荷 409
+        with get_conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM seal_incidents WHERE close_idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+        if existing and existing["close_request_hash"] == req_hash:
+            return _serialize_seal_incident(existing, replay=True)
+        raise HTTPException(
+            status_code=409,
+            detail="结案冲突：同一幂等键提交了不同载荷，或该事件已被并发结案",
+        )
+
+
+@app.get(
+    "/api/v1/exhibits/{exhibit_id}/seal-incidents",
+    response_model=list[SealIncidentOut],
+    tags=["seal-incidents"],
+)
+def list_seal_incidents(
+    exhibit_id: str,
+    status: str | None = Query(
+        default=None,
+        pattern="^(PENDING|RESOLVED)$",
+        description="仅返回指定状态的事件（PENDING 待核 / RESOLVED 已结案）",
+    ),
+):
+    """查询展品的待核封签事件链（按事件时序；可按状态过滤）。"""
+    sql = "SELECT * FROM seal_incidents WHERE exhibit_id = %s"
+    params: list = [exhibit_id]
+    if status:
+        sql += " AND status = %s"
+        params.append(status)
+    sql += " ORDER BY event_seq"
+    with get_conn() as conn:
+        exhibit = conn.execute(
+            "SELECT 1 FROM exhibits WHERE exhibit_id = %s", (exhibit_id,)
+        ).fetchone()
+        if not exhibit:
+            raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+        rows = conn.execute(sql, params).fetchall()
+    return [_serialize_seal_incident(r, replay=False) for r in rows]
+
+
+@app.get(
+    "/api/v1/exhibits/{exhibit_id}/seal-incidents/{event_id}",
+    response_model=SealIncidentOut,
+    tags=["seal-incidents"],
+)
+def get_seal_incident(exhibit_id: str, event_id: uuid.UUID):
+    """按事件编号查询单件待核封签事件（含结案复核结论与登记/结案时间）。"""
+    with get_conn() as conn:
+        exhibit = conn.execute(
+            "SELECT 1 FROM exhibits WHERE exhibit_id = %s", (exhibit_id,)
+        ).fetchone()
+        if not exhibit:
+            raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+        row = conn.execute(
+            "SELECT * FROM seal_incidents WHERE event_id = %s",
+            (event_id,),
+        ).fetchone()
+    if not row or row["exhibit_id"] != exhibit_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"展品「{exhibit_id}」不存在待核事件「{event_id}」（事件不存在或不属于该展品）",
+        )
+    return _serialize_seal_incident(row, replay=False)

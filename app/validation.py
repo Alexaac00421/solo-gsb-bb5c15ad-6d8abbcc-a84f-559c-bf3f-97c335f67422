@@ -78,6 +78,21 @@ def is_valid_voucher_digest(value: str | None) -> bool:
     return bool(value) and bool(VOUCHER_RE.match(value))
 
 
+def is_valid_seal_no(value: str | None) -> bool:
+    """封签号是否合法（待核事件登记/结案复用同一判定）。
+
+    规则与交接记录封签号一致：去首尾空白后非空、长度 1..100、且**原文**不含任何
+    空白字符（内部夹空白视为录入非法，避免「SEAL 1」与「SEAL-1」被当成不同封签；
+    API 层会先 strip 首尾空白，故首尾空白在到达本函数前已被规范化）。
+    """
+    if not value:
+        return False
+    if any(ch.isspace() for ch in value):
+        return False
+    text = value.strip()
+    return bool(text) and len(text) <= 100
+
+
 def validate_batch(state: ExhibitState, records: list) -> ValidationResult:
     """校验整批交接记录。records 元素需具备 location/from_person/to_person/
     seal_no/occurred_at/voucher_digest/seal_change_reason 属性。"""
