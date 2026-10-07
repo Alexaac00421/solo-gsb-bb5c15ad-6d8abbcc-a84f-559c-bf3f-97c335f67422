@@ -146,6 +146,36 @@ def correction_hash(
     return sha256_hex(canonical_json(payload))
 
 
+def seal_anomaly_request_hash(
+    exhibit_id: str,
+    expected_seal: str,
+    observed_seal: str,
+    reason: str,
+) -> str:
+    """封签异常待核事件登记请求体指纹：用于幂等键下检测「同键不同载荷」。"""
+    payload = {
+        "exhibit_id": exhibit_id,
+        "expected_seal": expected_seal,
+        "observed_seal": observed_seal,
+        "reason": (reason or "").strip(),
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def seal_anomaly_close_request_hash(
+    event_id,
+    observed_seal: str,
+    note: str,
+) -> str:
+    """封签异常事件结案请求体指纹：用于结案幂等键下检测「同键不同载荷」。"""
+    payload = {
+        "event_id": str(event_id),
+        "observed_seal": observed_seal,
+        "note": (note or "").strip(),
+    }
+    return sha256_hex(canonical_json(payload))
+
+
 def withdrawal_request_hash(
     exhibit_id: str,
     batch_id,

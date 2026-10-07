@@ -129,6 +129,38 @@ CREATE TABLE IF NOT EXISTS vehicle_handovers (
 );
 CREATE INDEX IF NOT EXISTS idx_vehicle_handovers_vehicle ON vehicle_handovers (vehicle_id, created_at);
 
+-- 封签异常待核事件：馆方发现实物封签异常时登记，复核人复核后结案。
+-- 登记时预期系统封签须等于撤回后当前有效封签、实见封签须不同；
+-- 同一展品同时只能有一件未结案（PENDING）事件（部分唯一索引兜底）。
+-- 待核期间：预演报冲突不签发令牌，单件交接与包含该展品的整车交接整单报冲突，
+-- 不落任何交接报告/记录；补正与撤回照常办理。
+-- 结案时复核实见封签须等于操作时当前有效封签，否则保持待核。
+-- 事件不入哈希链（状态可变），以服务端登记/结案时间为知悉时刻快照边界。
+CREATE TABLE IF NOT EXISTS seal_anomaly_events (
+    event_id            UUID        PRIMARY KEY,
+    idempotency_key     TEXT        NOT NULL,            -- 登记幂等键（全局唯一）
+    exhibit_id          TEXT        NOT NULL REFERENCES exhibits (exhibit_id),
+    expected_seal       TEXT        NOT NULL,            -- 登记时预期系统封签（= 当时撤回后有效封签）
+    observed_seal       TEXT        NOT NULL,            -- 实见封签（与预期不同）
+    reason              TEXT        NOT NULL,            -- 异常原因（非空）
+    status              TEXT        NOT NULL CHECK (status IN ('PENDING', 'CLOSED')),
+    request_hash        TEXT        NOT NULL,            -- 登记请求指纹（同键不同载荷 -> 409）
+    result              JSONB       NOT NULL,            -- 登记响应快照（幂等重放原样返回）
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 服务端登记时间
+    closed_at           TIMESTAMPTZ,                     -- 服务端结案时间（未结案为 NULL）
+    close_observed_seal TEXT,                            -- 复核实见封签
+    close_note          TEXT,                            -- 结案说明
+    close_idempotency_key TEXT,                          -- 结案幂等键（全局唯一，未结案为 NULL）
+    close_request_hash  TEXT,                            -- 结案请求指纹
+    close_result        JSONB,                           -- 结案响应快照（幂等重放原样返回）
+    UNIQUE (idempotency_key),
+    UNIQUE (close_idempotency_key)
+);
+-- 同一展品只能有一件未结案事件
+CREATE UNIQUE INDEX IF NOT EXISTS uq_seal_anomaly_pending
+    ON seal_anomaly_events (exhibit_id) WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS idx_seal_anomaly_exhibit ON seal_anomaly_events (exhibit_id, created_at);
+
 -- 种子数据：两件已登记展品，便于开箱即测
 INSERT INTO exhibits (exhibit_id, name, home_location, custodian, current_seal,
                       registered_custodian, registered_initial_seal)

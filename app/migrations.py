@@ -9,6 +9,7 @@
 - v1.3：批次撤回链（batch_withdrawals 表、exhibits.withdrawal_* 列，
         以及撤回后回退状态所需的 registered_custodian/registered_initial_seal 列）
 - v1.4：车次整车交接单（vehicle_handovers 表）
+- v1.6：封签异常待核事件（seal_anomaly_events 表）
 """
 from __future__ import annotations
 
@@ -125,6 +126,35 @@ _STATEMENTS = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_vehicle_handovers_vehicle ON vehicle_handovers (vehicle_id, created_at)",
+    # ---------------------------------------------------------------- 封签异常待核事件
+    """
+    CREATE TABLE IF NOT EXISTS seal_anomaly_events (
+        event_id            UUID        PRIMARY KEY,
+        idempotency_key     TEXT        NOT NULL,
+        exhibit_id          TEXT        NOT NULL REFERENCES exhibits (exhibit_id),
+        expected_seal       TEXT        NOT NULL,
+        observed_seal       TEXT        NOT NULL,
+        reason              TEXT        NOT NULL,
+        status              TEXT        NOT NULL CHECK (status IN ('PENDING', 'CLOSED')),
+        request_hash        TEXT        NOT NULL,
+        result              JSONB       NOT NULL,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+        closed_at           TIMESTAMPTZ,
+        close_observed_seal TEXT,
+        close_note          TEXT,
+        close_idempotency_key TEXT,
+        close_request_hash  TEXT,
+        close_result        JSONB,
+        UNIQUE (idempotency_key),
+        UNIQUE (close_idempotency_key)
+    )
+    """,
+    # 同一展品只能有一件未结案事件（部分唯一索引）
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_seal_anomaly_pending
+        ON seal_anomaly_events (exhibit_id) WHERE status = 'PENDING'
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_seal_anomaly_exhibit ON seal_anomaly_events (exhibit_id, created_at)",
 )
 
 

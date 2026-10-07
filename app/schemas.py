@@ -82,6 +82,73 @@ class WithdrawalRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500, description="撤回原因（非空；空缺 -> 422 拒绝）")
 
 
+# ---------------------------------------------------------------- 封签异常待核事件
+
+
+class SealAnomalyEventRequest(BaseModel):
+    """封签异常待核事件登记（同一展品同时只能有一件未结案事件）。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    expected_seal: str = Field(min_length=1, max_length=100, description="预期系统封签（须等于撤回后当前有效封签，不符 -> 409 冲突）")
+    observed_seal: str = Field(min_length=1, max_length=100, description="实见封签（须与预期不同，相同 -> 422 拒绝）")
+    reason: str = Field(min_length=1, max_length=500, description="异常原因（非空；空缺 -> 422 拒绝）")
+
+
+class SealAnomalyCloseRequest(BaseModel):
+    """封签异常待核事件结案（复核实见封签须等于操作时当前有效封签，否则保持待核）。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    observed_seal: str = Field(min_length=1, max_length=100, description="复核实见封签（与操作时当前有效封签不符 -> 409 冲突，事件保持待核）")
+    note: str = Field(min_length=1, max_length=500, description="结案说明（非空；空缺 -> 422 拒绝）")
+
+
+class SealAnomalyEventOut(BaseModel):
+    """封签异常待核事件（首次登记 201；同键同载荷重放 200）。
+
+    事件生命周期：PENDING（待核）-> CLOSED（已结案）；结案字段仅结案后呈现。
+    """
+
+    event_id: str
+    exhibit_id: str
+    expected_seal: str = Field(description="登记时的预期系统封签（= 登记时撤回后当前有效封签）")
+    observed_seal: str = Field(description="登记时的实见封签")
+    reason: str
+    status: Literal["PENDING", "CLOSED"]
+    idempotent_replay: bool
+    created_at: datetime = Field(description="服务端登记时间")
+    closed_at: Optional[datetime] = Field(default=None, description="服务端结案时间（未结案为 null）")
+    close_observed_seal: Optional[str] = Field(default=None, description="结案时的复核实见封签")
+    close_note: Optional[str] = Field(default=None, description="结案说明")
+
+
+class SealAnomalyCloseOut(BaseModel):
+    """结案结果（首次结案 201；同键同载荷重放 200）。"""
+
+    event_id: str
+    exhibit_id: str
+    status: Literal["CLOSED"]
+    expected_seal: str
+    observed_seal: str
+    reason: str
+    close_observed_seal: str = Field(description="复核实见封签（结案时与当前有效封签比对一致）")
+    close_note: str
+    idempotent_replay: bool
+    created_at: datetime = Field(description="服务端登记时间")
+    closed_at: datetime = Field(description="服务端结案时间")
+
+
+class SealAnomalyRefOut(BaseModel):
+    """知悉时刻快照中呈现的该时点未结案封签异常事件（摘要视图）。"""
+
+    event_id: str
+    expected_seal: str
+    observed_seal: str
+    reason: str
+    created_at: datetime = Field(description="服务端登记时间")
+
+
 class ReasonOut(BaseModel):
     rule: str
     message: str
@@ -335,6 +402,11 @@ class AsOfStateOut(BaseModel):
     # 三条事件链在该时点的长度（三链在同一数据库快照截取）
     correction_chain_length: int = Field(description="知悉时刻已受理补正环数（按目标在可见原链内计）")
     withdrawal_chain_length: int = Field(description="知悉时刻已受理撤回环数")
+    # 封签异常待核事件：该时点已登记且尚未结案的事件（以服务端登记/结案时间为界）
+    pending_seal_anomaly: Optional[SealAnomalyRefOut] = Field(
+        default=None,
+        description="知悉时刻处于待核状态的封签异常事件（登记时间 <= at 且当时未结案）；无则 null",
+    )
 
 
 class AuditVerifyOut(BaseModel):

@@ -3,7 +3,8 @@
 # 提交违规批次（不落记录）-> 令牌失效与重新预演 -> 查询交接链 -> 哈希链审计校验 ->
 # 凭证摘要补正（拒绝/冲突/幂等/独立补正链）-> 双链审计 ->
 # 已受理批次撤回（拒绝/幂等/独立撤回链/有效状态回退）-> 三链审计 ->
-# 车次整车交接（整单确认/拒绝/幂等/冲突/与单件接口共存）。
+# 车次整车交接（整单确认/拒绝/幂等/冲突/与单件接口共存）-> 知悉时刻历史快照 ->
+# 封签异常待核事件（登记/待核封锁/复核结案/事件查询与时点快照）。
 # 用法：BASE=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -511,5 +512,136 @@ print(urllib.parse.quote(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.
 PY
 )"
 curl -s "${BASE}/api/v1/exhibits/${AID}/state-at?at=${NOW_ENC}" | pp
+
+# ---------------------------------------------------------------- 封签异常待核事件
+# 独立演示展品：登记 -> 待核期间交接封锁 -> 复核结案 -> 解锁恢复。
+SID="EX-SEAL-$(date +%s)"
+KEY_SA="demo-sa-${SID}"
+KEY_SC="demo-sc-${SID}"
+
+echo; echo "== 48) 登记封签异常演示展品 ${SID} 并提交一笔已受理批次（当前有效封签 SEAL-D1）=="
+curl -s -X POST "${BASE}/api/v1/exhibits" -H 'Content-Type: application/json' \
+  -d "{\"exhibit_id\":\"${SID}\",\"name\":\"元代青花釉里红罐\",\"home_location\":\"库房A\",\"custodian\":\"张伟\",\"initial_seal\":\"SEAL-D1\"}" | pp
+curl -s -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sa-b1-${SID}" \
+  -d '{"exhibit_id":"'"${SID}"'","records":[{"location":"库房A","from_person":"张伟","to_person":"李静","seal_no":"SEAL-D1","occurred_at":"2026-09-01T09:00:00+08:00","voucher_digest":"sha256:ababababababababababababababababababababababababababababababab"}]}' | pp
+
+echo; echo "== 49) 登记封签异常待核事件：201，返回事件编号、状态（PENDING）与登记时间 =="
+EVENT_JSON="$(curl -s -X POST "${BASE}/api/v1/exhibits/${SID}/seal-anomaly-events" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: ${KEY_SA}" \
+  -d '{"expected_seal":"SEAL-D1","observed_seal":"SEAL-D9","reason":"出库复核发现实物封签与系统不符，疑似运输途中破损（异常登记单 SA-2026-1001）"}')"
+echo "${EVENT_JSON}" | pp
+EVENT_ID="$(echo "${EVENT_JSON}" | json_field event_id)"
+EVENT_AT="$(echo "${EVENT_JSON}" | json_field created_at)"
+echo "事件编号：${EVENT_ID}（登记时间 ${EVENT_AT}）"
+[ -n "${EVENT_ID}" ] || { echo "未取到事件编号，终止"; exit 1; }
+
+echo; echo "== 50) 同键同载荷重试：返回首次登记结果（200, idempotent_replay=true）；同键异载荷 -> 409 =="
+curl -s -D /tmp/sa50.hdr -X POST "${BASE}/api/v1/exhibits/${SID}/seal-anomaly-events" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: ${KEY_SA}" \
+  -d '{"expected_seal":"SEAL-D1","observed_seal":"SEAL-D9","reason":"出库复核发现实物封签与系统不符，疑似运输途中破损（异常登记单 SA-2026-1001）"}' | pp
+grep -i '^HTTP/' /tmp/sa50.hdr
+curl -s -o /dev/null -w '同键异载荷 -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/exhibits/${SID}/seal-anomaly-events" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: ${KEY_SA}" \
+  -d '{"expected_seal":"SEAL-D1","observed_seal":"SEAL-D8","reason":"换载荷"}'
+
+echo; echo "== 51) 登记拒绝用例：预期不符(409) / 实见=预期(422) / 原因空(422) / 重复待核(409) / 未知展品(404) =="
+curl -s -o /dev/null -w '预期封签与有效封签不符 -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/exhibits/${SID}/seal-anomaly-events" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sa-badexp-${SID}" \
+  -d '{"expected_seal":"SEAL-D2","observed_seal":"SEAL-D9","reason":"x"}'
+curl -s -o /dev/null -w '实见封签与预期相同       -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/exhibits/${SID}/seal-anomaly-events" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sa-same-${SID}" \
+  -d '{"expected_seal":"SEAL-D1","observed_seal":"SEAL-D1","reason":"x"}'
+curl -s -o /dev/null -w '原因空缺                 -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/exhibits/${SID}/seal-anomaly-events" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sa-empty-${SID}" \
+  -d '{"expected_seal":"SEAL-D1","observed_seal":"SEAL-D9","reason":"   "}'
+curl -s -o /dev/null -w '重复待核                 -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/exhibits/${SID}/seal-anomaly-events" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sa-dup-${SID}" \
+  -d '{"expected_seal":"SEAL-D1","observed_seal":"SEAL-D8","reason":"再登记一件"}'
+curl -s -o /dev/null -w '未知展品                 -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/exhibits/EX-NOT-EXIST/seal-anomaly-events" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sa-miss-${SID}" \
+  -d '{"expected_seal":"S","observed_seal":"T","reason":"x"}'
+
+echo; echo "== 52) 待核期间：预演 409 不签发令牌；单件交接 409 不落报告/记录；整车交接整单 409 不写入 =="
+curl -s -o /dev/null -w '预演           -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/handover-batches/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d '{"exhibit_id":"'"${SID}"'","records":[{"location":"展厅","from_person":"李静","to_person":"王强","seal_no":"SEAL-D1","occurred_at":"2026-09-02T09:00:00+08:00","voucher_digest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}]}'
+curl -s -o /dev/null -w '单件交接       -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sa-blocked-${SID}" \
+  -d '{"exhibit_id":"'"${SID}"'","records":[{"location":"展厅","from_person":"李静","to_person":"王强","seal_no":"SEAL-D1","occurred_at":"2026-09-02T09:00:00+08:00","voucher_digest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}]}'
+curl -s -o /dev/null -w '整车交接       -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/vehicle-handovers" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sa-veh-${SID}" \
+  -d '{"vehicle_id":"TRAIN-2026-9001","items":[{"exhibit_id":"'"${SID}"'","records":[{"location":"展厅","from_person":"李静","to_person":"王强","seal_no":"SEAL-D1","occurred_at":"2026-09-02T09:00:00+08:00","voucher_digest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}]},{"exhibit_id":"'"${V1}"'","records":[{"location":"上海博物馆交接区","from_person":"王强","to_person":"陈晨","seal_no":"SEAL-NJ-1001","occurred_at":"2026-09-12T09:00:00+08:00","voucher_digest":"sha256:5566778899aabbccddeeff00112233445566778899aabbccddeeff0011223344"}]}]}'
+echo "--- 待核期间链状态未推进（chain_length 仍为 1，批次历史仅 1 笔）---"
+curl -s "${BASE}/api/v1/exhibits/${SID}" | pp
+
+echo; echo "== 53) 待核期间补正照常办理（第 1 环凭证摘要补正 -> 201）=="
+curl -s -X POST "${BASE}/api/v1/exhibits/${SID}/handovers/1/digest-corrections" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sa-c1-${SID}" \
+  -d '{"expected_digest":"sha256:ababababababababababababababababababababababababababababababab","new_digest":"sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00918273645564738291a0b1c2d3e4f50","reason":"凭证摘要录入笔误更正"}' | pp
+
+echo; echo "== 54) 复核结案：复核封签与当前有效封签不符 -> 409 保持待核；相符 -> 201 结案 =="
+curl -s -o /dev/null -w '复核封签不符 -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/seal-anomaly-events/${EVENT_ID}/close" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sc-wrong-${SID}" \
+  -d '{"observed_seal":"SEAL-D9","note":"以实见异常封签复核"}'
+CLOSE_JSON="$(curl -s -X POST "${BASE}/api/v1/seal-anomaly-events/${EVENT_ID}/close" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: ${KEY_SC}" \
+  -d '{"observed_seal":"SEAL-D1","note":"双人复核确认实物封签与系统当前有效封签一致，此前差异系盘点误读（复核单 SR-2026-1001）"}')"
+echo "${CLOSE_JSON}" | pp
+CLOSED_AT="$(echo "${CLOSE_JSON}" | json_field closed_at)"
+
+echo; echo "== 55) 结案幂等与拒绝：同键重放(200) / 同键异载荷(409) / 重复结案(409) / 未知事件(404) / 说明空(422) =="
+curl -s -D /tmp/sc55.hdr -X POST "${BASE}/api/v1/seal-anomaly-events/${EVENT_ID}/close" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: ${KEY_SC}" \
+  -d '{"observed_seal":"SEAL-D1","note":"双人复核确认实物封签与系统当前有效封签一致，此前差异系盘点误读（复核单 SR-2026-1001）"}' | pp
+grep -i '^HTTP/' /tmp/sc55.hdr
+curl -s -o /dev/null -w '同键异载荷   -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/seal-anomaly-events/${EVENT_ID}/close" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: ${KEY_SC}" \
+  -d '{"observed_seal":"SEAL-D1","note":"换载荷"}'
+curl -s -o /dev/null -w '重复结案     -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/seal-anomaly-events/${EVENT_ID}/close" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sc-again-${SID}" \
+  -d '{"observed_seal":"SEAL-D1","note":"再次结案"}'
+curl -s -o /dev/null -w '未知事件     -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/seal-anomaly-events/9f9c646e-0000-0000-0000-000000000000/close" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sc-miss-${SID}" \
+  -d '{"observed_seal":"SEAL-D1","note":"x"}'
+curl -s -o /dev/null -w '结案说明空缺 -> HTTP %{http_code}\n' -X POST "${BASE}/api/v1/seal-anomaly-events/${EVENT_ID}/close" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sc-empty-${SID}" \
+  -d '{"observed_seal":"SEAL-D1","note":"  "}'
+
+echo; echo "== 56) 解锁后：预演恢复签发令牌，凭令牌提交正常受理（旧令牌仅按原链状态规则判断）=="
+TOKEN_SA="$(curl -s -X POST "${BASE}/api/v1/handover-batches/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d '{"exhibit_id":"'"${SID}"'","records":[{"location":"展厅","from_person":"李静","to_person":"王强","seal_no":"SEAL-D1","occurred_at":"2026-09-02T09:00:00+08:00","voucher_digest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}]}' | extract_token)"
+echo "已取得状态令牌：${TOKEN_SA:0:40}..."
+curl -s -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-sa-cont-${SID}" \
+  -H "Handover-Token: ${TOKEN_SA}" \
+  -d '{"exhibit_id":"'"${SID}"'","records":[{"location":"展厅","from_person":"李静","to_person":"王强","seal_no":"SEAL-D1","occurred_at":"2026-09-02T09:00:00+08:00","voucher_digest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}]}' | pp
+
+echo; echo "== 57) 事件查询：列表（含状态过滤）、单事件、知悉时刻 at 视图 =="
+curl -s "${BASE}/api/v1/exhibits/${SID}/seal-anomaly-events" | pp
+curl -s "${BASE}/api/v1/seal-anomaly-events/${EVENT_ID}" | pp
+EVENT_AT_ENC="$(python3 - "${EVENT_AT}" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1]))
+PY
+)"
+echo "--- at=登记时刻：该时点事件仍处于待核（结案字段不提前出现）---"
+curl -s "${BASE}/api/v1/exhibits/${SID}/seal-anomaly-events?at=${EVENT_AT_ENC}" | pp
+
+echo; echo "== 58) 知悉时刻快照中的待核状态：以服务端登记/结案时间为界 =="
+echo "--- at=登记时刻：pending_seal_anomaly 呈现该事件 ---"
+curl -s "${BASE}/api/v1/exhibits/${SID}/state-at?at=${EVENT_AT_ENC}" | pp
+CLOSED_AT_ENC="$(python3 - "${CLOSED_AT}" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1]))
+PY
+)"
+echo "--- at=结案时刻：pending_seal_anomaly 为 null（已结案）---"
+curl -s "${BASE}/api/v1/exhibits/${SID}/state-at?at=${CLOSED_AT_ENC}" | pp
+
+echo; echo "== 59) 三链审计复算：封签异常事件不影响交接/补正/撤回哈希链 =="
+curl -s "${BASE}/api/v1/exhibits/${SID}/audit/verify" | pp
+
 
 
